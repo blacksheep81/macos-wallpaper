@@ -68,6 +68,17 @@ extension NSScreen {
 		deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! CGDirectDisplayID
 	}
 
+	/**
+	Hardware UUID for this screen, matching `displays.display_uuid` in `desktoppicture.db`.
+	*/
+	var displayUUID: String? {
+		guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else {
+			return nil
+		}
+
+		return CFUUIDCreateString(kCFAllocatorDefault, uuid) as String
+	}
+
 	var name: String {
 		if #available(macOS 10.15, *) {
 			return localizedName

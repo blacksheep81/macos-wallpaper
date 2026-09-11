@@ -1,9 +1,6 @@
 import AppKit
 import SQLite
 
-// https://github.com/stephencelis/SQLite.swift/issues/1277
-typealias Expression = SQLite.Expression
-
 public enum Wallpaper {
 	public enum Screen {
 		case all
@@ -48,7 +45,112 @@ public enum Wallpaper {
 
 	Note: This workaround is only needed on macOS versions prior to macOS 26. On macOS 26+, the database schema may have changed or may not exist, and NSWorkspace.shared.desktopImageURL appears to return proper file paths.
 	*/
-	private static func getFromDirectory(_ url: URL) throws -> URL {
+	private static func imageURL(for value: String, in directoryURL: URL) -> URL {
+		if
+			let fileURL = URL(string: value),
+			fileURL.isFileURL
+		{
+			return fileURL
+		}
+
+		let expanded = (value as NSString).expandingTildeInPath
+		if (expanded as NSString).isAbsolutePath {
+			return URL(fileURLWithPath: expanded, isDirectory: false)
+		}
+
+		return directoryURL.appendingPathComponent(value, isDirectory: false)
+	}
+
+	private static func scalarString(
+		_ query: String,
+		binding: String? = nil,
+		database: Connection
+	) -> String? {
+		do {
+			let value: Binding?
+			if let binding {
+				value = try database.scalar(query, binding)
+			} else {
+				value = try database.scalar(query)
+			}
+
+			guard let image = value as? String, !image.isEmpty else {
+				return nil
+			}
+
+			return image
+		} catch {
+			return nil
+		}
+	}
+
+	/**
+	Resolve the current image for a directory-backed wallpaper from `desktoppicture.db`.
+
+	`NSWorkspace.desktopImageURL(for:)` is already screen-specific, but when the wallpaper is a rotating folder it returns that folder for every display. The Dock database stores the actual file per display:
+
+	- `preferences.key = 16`: current image while auto-rotation is enabled
+	- `preferences.key = 1`: static image path
+	*/
+	static func resolveDirectoryWallpaper(
+		_ directoryURL: URL,
+		displayUUID: String?,
+		database: Connection
+	) throws -> URL {
+		// Prefer the display-specific row, then a global (display_id IS NULL) row.
+		// Key 16 is the currently visible file in a rotating directory; key 1 is a static image.
+		let preferenceOrder = """
+			ORDER BY
+				CASE preferences.key WHEN 16 THEN 0 ELSE 1 END,
+				preferences.ROWID DESC
+			LIMIT 1
+			"""
+
+		if let displayUUID {
+			let displayQuery = """
+				SELECT data.value
+				FROM preferences
+				JOIN data ON preferences.data_id = data.ROWID
+				JOIN pictures ON preferences.picture_id = pictures.ROWID
+				JOIN displays ON pictures.display_id = displays.ROWID
+				WHERE preferences.key IN (16, 1)
+					AND displays.display_uuid = ? COLLATE NOCASE
+				\(preferenceOrder)
+				"""
+
+			if let image = scalarString(displayQuery, binding: displayUUID, database: database) {
+				return imageURL(for: image, in: directoryURL)
+			}
+		}
+
+		let globalQuery = """
+			SELECT data.value
+			FROM preferences
+			JOIN data ON preferences.data_id = data.ROWID
+			JOIN pictures ON preferences.picture_id = pictures.ROWID
+			WHERE preferences.key IN (16, 1)
+				AND pictures.display_id IS NULL
+			\(preferenceOrder)
+			"""
+
+		if let image = scalarString(globalQuery, database: database) {
+			return imageURL(for: image, in: directoryURL)
+		}
+
+		// Older / incomplete schemas have no display relationships; keep the previous global lookup.
+		let legacyQuery = "SELECT value FROM data ORDER BY ROWID DESC LIMIT 1"
+		guard let image = scalarString(legacyQuery, database: database) else {
+			throw NSError(
+				domain: "WallpaperError",
+				code: 2,
+				userInfo: [NSLocalizedDescriptionKey: "Could not resolve the current wallpaper from the desktop picture database."]
+			)
+		}
+
+		return imageURL(for: image, in: directoryURL)
+	}
+
+	private static func getFromDirectory(_ url: URL, screen: NSScreen) throws -> URL {
 		// On macOS 26+, skip the database workaround as it may not be available
 		// and the underlying bug appears to be fixed
 		if #available(macOS 26, *) {
@@ -57,31 +159,26 @@ public enum Wallpaper {
 
 		let appSupportDirectory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
 		let dbURL = appSupportDirectory.appendingPathComponent("Dock/desktoppicture.db", isDirectory: false)
-
-		let table = Table("data")
-		let column = Expression<String>("value")
-		let rowID = Expression<Int64>("rowid")
-
 		let db = try Connection(dbURL.path)
-		let maxID = try db.scalar(table.select(rowID.max))!
-		let query = table.select(column).filter(rowID == maxID)
-		let image = try db.pluck(query)!.get(column)
 
-		return url.appendingPathComponent(image, isDirectory: false)
+		return try resolveDirectoryWallpaper(url, displayUUID: screen.displayUUID, database: db)
 	}
 
 	/**
 	Get the current wallpapers.
 	*/
 	public static func get(screen: Screen = .all) throws -> [URL] {
-		let wallpaperURLs = screen.nsScreens.compactMap { NSWorkspace.shared.desktopImageURL(for: $0) }
-		return wallpaperURLs.map { url in
+		screen.nsScreens.compactMap { nsScreen in
+			guard let url = NSWorkspace.shared.desktopImageURL(for: nsScreen) else {
+				return nil
+			}
+
 			if url.isDirectory {
 				// Try to get specific image from directory, fall back to directory if it fails (e.g., in sandbox)
-				return (try? getFromDirectory(url)) ?? url
-			} else {
-				return url
+				return (try? getFromDirectory(url, screen: nsScreen)) ?? url
 			}
+
+			return url
 		}
 	}
 
