@@ -43,6 +43,16 @@ let package = Package(
 					package: "SQLite.swift"
 				)
 			]
+		),
+		.testTarget(
+			name: "WallpaperTests",
+			dependencies: [
+				"Wallpaper",
+				.product(
+					name: "SQLite",
+					package: "SQLite.swift"
+				)
+			]
 		)
 	]
 )
